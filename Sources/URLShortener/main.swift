@@ -7,7 +7,6 @@
 
 import Vapor
 import Fluent
-import FluentSQLiteDriver
 
 // ── 1. Build the application ──
 let app = try await Application.make(.detect())

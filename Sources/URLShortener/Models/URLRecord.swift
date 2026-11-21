@@ -13,13 +13,13 @@ import Vapor
 final class URLRecord: Model, Content, @unchecked Sendable {
     static let schema = "url_records"
 
-    // ── Primary key (auto-increment) ──
-    @ID(custom: .id)
-    var id: Int?
+    // ── Primary key: the Base62 short code itself ──
+    @ID(custom: "shortCode", generatedBy: .user)
+    var id: String?
 
-    // ── Short code: 6-char alphanumeric, unique ──
-    @Field(key: "shortCode")
-    var shortCode: String
+    // ── SHA-256 of the normalized long URL, 32 raw bytes (unique → idempotent create) ──
+    @Field(key: "urlHash")
+    var urlHash: Data
 
     // ── The long URL we're storing ──
     @Field(key: "longURL")
@@ -35,12 +35,9 @@ final class URLRecord: Model, Content, @unchecked Sendable {
 
     init() {}
 
-    init(id: Int? = nil,
-         shortCode: String,
-         longURL: String,
-         hitCount: Int = 0) {
-        self.id = id
-        self.shortCode = shortCode
+    init(shortCode: String, urlHash: Data, longURL: String, hitCount: Int = 0) {
+        self.id = shortCode
+        self.urlHash = urlHash
         self.longURL = longURL
         self.hitCount = hitCount
     }

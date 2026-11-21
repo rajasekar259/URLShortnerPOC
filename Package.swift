@@ -11,8 +11,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/vapor/vapor.git", from: "4.122.4"),
         .package(url: "https://github.com/vapor/fluent.git", from: "4.13.0"),
-        .package(url: "https://github.com/vapor/fluent-sqlite-driver.git", from: "4.9.0"),
-        .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.37.0"),
+        .package(url: "https://github.com/vapor/fluent-postgres-driver.git", from: "2.10.0"),
     ],
     targets: [
         .executableTarget(
@@ -20,7 +19,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Vapor", package: "vapor"),
                 .product(name: "Fluent", package: "fluent"),
-                .product(name: "FluentSQLiteDriver", package: "fluent-sqlite-driver")
+                .product(name: "FluentPostgresDriver", package: "fluent-postgres-driver")
             ],
             swiftSettings: [
                 .swiftLanguageMode(.v6)
