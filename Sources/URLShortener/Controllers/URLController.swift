@@ -78,6 +78,8 @@ struct URLController: RouteCollection {
         }
 
         let shortCode = try record.requireID()
+        // Write-through: the first click on a brand-new link then needs no database read.
+        await req.application.redirectCache.store(shortCode, longURL: record.longURL)
         let shortURL = "\(req.application.config.baseURL)/\(shortCode)"
         return ShortenResponse(shortCode: shortCode, shortURL: shortURL, longURL: record.longURL)
     }
@@ -88,18 +90,22 @@ struct URLController: RouteCollection {
     func redirect(_ req: Request) async throws -> Response {
         let code = try req.parameters.require("shortCode")
 
-        guard let record = try await URLRecord.find(code, on: req.db) else {
+        // Cache first; on a miss one database read is shared by all concurrent requests for this code.
+        let db = req.db
+        let longURL = try await req.application.redirectCache.resolve(code) {
+            try await URLRecord.find(code, on: db)?.longURL
+        }
+        guard let longURL else {
             throw Abort(.notFound, headers: Self.noStore, reason: "Short code '\(code)' not found")
         }
 
-        // Bump hit counter
-        record.hitCount += 1
-        try await record.save(on: req.db)
+        // Counted in memory and written to Postgres in batches, so a redirect never writes to the database.
+        await req.application.hitCounter.record(code)
 
         // 307 = temporary redirect, so browsers don't remember it (301/308 are cached forever).
         // no-store also keeps proxies from caching it, so every click reaches the server and
         // deletes take effect immediately.
-        let response = req.redirect(to: record.longURL, redirectType: .temporary)
+        let response = req.redirect(to: longURL, redirectType: .temporary)
         response.headers.replaceOrAdd(name: .cacheControl, value: "no-store")
         return response
     }
@@ -119,10 +125,12 @@ struct URLController: RouteCollection {
         guard let record = try await URLRecord.find(code, on: req.db) else {
             throw Abort(.notFound, headers: Self.noStore, reason: "Not found")
         }
+        // Stored count plus this server's hits that haven't been flushed yet, so the number is exact.
+        let unflushed = await req.application.hitCounter.unflushedCount(for: code)
         let info = LookupResponse(
             shortCode: code,
             longURL:   record.longURL,
-            hitCount:  record.hitCount,
+            hitCount:  record.hitCount + unflushed,
             createdAt: record.createdAt ?? Date()
         )
         // hitCount changes on every redirect, so this must never be served from a cache.
@@ -144,6 +152,8 @@ struct URLController: RouteCollection {
             throw Abort(.notFound)
         }
         try await record.delete(on: req.db)
+        // The link must stop redirecting immediately, not when its cache entry expires.
+        await req.application.redirectCache.invalidate(code)
         return .noContent
     }
 }

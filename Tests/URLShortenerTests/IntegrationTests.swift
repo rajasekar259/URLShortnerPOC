@@ -35,11 +35,13 @@ private func withTestApp(_ body: (Application) async throws -> Void) async throw
         try await app.autoMigrate()
         try await body(app)
     } catch {
+        try? await app.hitCounter.flush()
         try? await app.autoRevert()
         try? await app.asyncShutdown()
         throw error
     }
-    try await app.autoRevert()       // drop test data and tables
+    try await app.hitCounter.flush()  // write pending hits while the tables still exist
+    try await app.autoRevert()        // drop test data and tables
     try await app.asyncShutdown()
 }
 
@@ -329,6 +331,234 @@ extension Integration {
                 #expect(second != first)
                 let hoisted6 = try await send(app, .GET, second).status
                 #expect(hoisted6 == .temporaryRedirect)
+            }
+        }
+    }
+
+    @Suite("Hit counts (Postgres)")
+    struct HitStoreTests {
+        private func hitCount(_ app: Application, _ code: String) async throws -> Int? {
+            try await URLRecord.find(code, on: app.db)?.hitCount
+        }
+
+        @Test("apply() adds to the stored count")
+        func additive() async throws {
+            try await withTestApp { app in
+                let a = try #require(try await shorten(app, "https://a.test").code)
+                let b = try #require(try await shorten(app, "https://b.test").code)
+                let store = PostgresHitStore(database: app.db)
+
+                try await store.apply([a: 3, b: 5])
+                try await store.apply([a: 2])
+
+                let countA = try await hitCount(app, a)
+                let countB = try await hitCount(app, b)
+                #expect(countA == 5)
+                #expect(countB == 5)
+            }
+        }
+
+        @Test("Codes that no longer exist are ignored")
+        func unknownCodes() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://a.test").code)
+                let store = PostgresHitStore(database: app.db)
+
+                try await store.apply(["zzzzzzz": 9, code: 1])    // "zzzzzzz" was never created (or was deleted)
+
+                let count = try await hitCount(app, code)
+                #expect(count == 1)
+            }
+        }
+
+        @Test("An empty batch is a no-op")
+        func emptyBatch() async throws {
+            try await withTestApp { app in
+                try await PostgresHitStore(database: app.db).apply([:])
+            }
+        }
+
+        @Test("Batches larger than the statement size are split and all applied")
+        func largeBatch() async throws {
+            try await withTestApp { app in
+                let total = PostgresHitStore.batchSize * 2 + 500
+                let records = (0..<total).map { i in
+                    URLRecord(shortCode: String(format: "%07d", i),
+                              urlHash: URLNormalizer.hash("https://bulk.test/\(i)"),
+                              longURL: "https://bulk.test/\(i)")
+                }
+                try await records.create(on: app.db)
+
+                var increments: [String: Int] = [:]
+                for i in 0..<total { increments[String(format: "%07d", i)] = i % 7 + 1 }
+                try await PostgresHitStore(database: app.db).apply(increments)
+
+                let stored = try await URLRecord.query(on: app.db).all().reduce(0) { $0 + $1.hitCount }
+                #expect(stored == increments.values.reduce(0, +))
+            }
+        }
+
+        @Test("Concurrent applies are additive and lose nothing")
+        func concurrentApplies() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://a.test").code)
+                let store = PostgresHitStore(database: app.db)
+
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    for _ in 0..<50 { group.addTask { try await store.apply([code: 2]) } }
+                    try await group.waitForAll()
+                }
+
+                let count = try await hitCount(app, code)
+                #expect(count == 100)
+            }
+        }
+
+        @Test("The app's HitCounter writes recorded hits through to Postgres")
+        func counterEndToEnd() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://a.test").code)
+
+                for _ in 0..<25 { await app.hitCounter.record(code) }
+                let before = try await hitCount(app, code)
+                #expect(before == 0)                                       // nothing written yet
+                let unflushed = await app.hitCounter.unflushedCount(for: code)
+                #expect(unflushed == 25)
+
+                try await app.hitCounter.flush()
+                let after = try await hitCount(app, code)
+                #expect(after == 25)
+            }
+        }
+
+        @Test("The lifecycle shutdown handler flushes pending hits")
+        func lifecycleFlushesOnShutdown() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://a.test").code)
+                for _ in 0..<7 { await app.hitCounter.record(code) }
+
+                await HitCounterLifecycle(counter: app.hitCounter).shutdownAsync(app)
+
+                let count = try await hitCount(app, code)
+                #expect(count == 7)
+            }
+        }
+    }
+
+    @Suite("Redirect cache and hit counting")
+    struct WiredCacheTests {
+        private func insertDirectly(_ app: Application, code: String, url: String) async throws {
+            try await URLRecord(shortCode: code, urlHash: URLNormalizer.hash(url), longURL: url).create(on: app.db)
+        }
+
+        private func storedHitCount(_ app: Application, _ code: String) async throws -> Int? {
+            try await URLRecord.find(code, on: app.db)?.hitCount
+        }
+
+        @Test("A new link is cached on create, so its first redirect needs no database read")
+        func writeThrough() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+                try await URLRecord.query(on: app.db).delete()      // remove the row behind the app's back
+
+                let reply = try await send(app, .GET, code)
+                #expect(reply.status == .temporaryRedirect)
+                #expect(reply.location == "https://example.com/")
+                let stats = await app.redirectCache.stats
+                #expect(stats.misses == 0)
+                #expect(stats.hits == 1)
+            }
+        }
+
+        @Test("Concurrent cold redirects for one code cause a single database read")
+        func coldRedirectsShareOneLoad() async throws {
+            try await withTestApp { app in
+                try await insertDirectly(app, code: "0000042", url: "https://cold.test/")   // bypasses write-through
+
+                let statuses = try await withThrowingTaskGroup(of: HTTPStatus.self) { group in
+                    for _ in 0..<100 { group.addTask { try await send(app, .GET, "0000042").status } }
+                    return try await group.reduce(into: [HTTPStatus]()) { $0.append($1) }
+                }
+
+                #expect(statuses.allSatisfy { $0 == .temporaryRedirect })
+                let stats = await app.redirectCache.stats
+                #expect(stats.misses == 1)
+                #expect(stats.hits + stats.coalesced == 99)
+            }
+        }
+
+        @Test("Deleting through the API invalidates the cache immediately")
+        func deleteInvalidates() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+                let cached = try await send(app, .GET, code)
+                #expect(cached.status == .temporaryRedirect)
+
+                _ = try await send(app, .DELETE, "api/url/\(code)")
+
+                let after = try await send(app, .GET, code)
+                #expect(after.status == .notFound)
+            }
+        }
+
+        @Test("Unknown codes are negatively cached, so repeats don't reach the database")
+        func negativeCache() async throws {
+            try await withTestApp { app in
+                let first = try await send(app, .GET, "0000099")
+                #expect(first.status == .notFound)
+
+                try await insertDirectly(app, code: "0000099", url: "https://late.test/")   // appears afterwards
+
+                let second = try await send(app, .GET, "0000099")
+                #expect(second.status == .notFound)                  // still served from the negative cache
+                let stats = await app.redirectCache.stats
+                #expect(stats.negativeHits == 1)
+            }
+        }
+
+        @Test("Redirects do not write to the database; hits are written when flushed")
+        func hitsAreBatched() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+                for _ in 0..<50 { _ = try await send(app, .GET, code) }
+
+                let beforeFlush = try await storedHitCount(app, code)
+                #expect(beforeFlush == 0)                            // nothing written yet
+                let lookedUp = try await lookup(app, code)
+                #expect(lookedUp.info?.hitCount == 50)               // but the metadata is exact
+
+                try await app.hitCounter.flush()
+
+                let afterFlush = try await storedHitCount(app, code)
+                #expect(afterFlush == 50)
+                let again = try await lookup(app, code)
+                #expect(again.info?.hitCount == 50)                  // flushed hits are not counted twice
+            }
+        }
+
+        @Test("1,000 concurrent redirects are counted exactly")
+        func thousandConcurrentRedirects() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+
+                let statuses = try await withThrowingTaskGroup(of: HTTPStatus.self) { group in
+                    for _ in 0..<1_000 { group.addTask { try await send(app, .GET, code).status } }
+                    return try await group.reduce(into: [HTTPStatus]()) { $0.append($1) }
+                }
+                #expect(statuses.allSatisfy { $0 == .temporaryRedirect })
+
+                try await app.hitCounter.flush()
+                let stored = try await storedHitCount(app, code)
+                #expect(stored == 1_000)
+            }
+        }
+
+        @Test("Redirects for unknown codes are not counted")
+        func unknownNotCounted() async throws {
+            try await withTestApp { app in
+                _ = try await send(app, .GET, "0000077")
+                let unflushed = await app.hitCounter.unflushedCount(for: "0000077")
+                #expect(unflushed == 0)
             }
         }
     }

@@ -18,6 +18,23 @@ func configure(_ app: Application) async throws {
     // ── Database ──
     app.databases.use(try .postgres(url: config.databaseURL), as: .psql)
 
+    // ── Redirect cache (in-process LRU; swap for a shared cache when running several instances) ──
+    app.redirectCache = RedirectCache(configuration: .init(
+        maxEntries: config.cacheMaxEntries,
+        ttl: config.cacheTTL,
+        negativeTTL: config.negativeCacheTTL
+    ))
+
+    // ── Hit counting: in-memory counts flushed to Postgres in batches ──
+    // Registered after the database so shutdown flushes the counts before the database closes.
+    let hitCounter = HitCounter(
+        store: PostgresHitStore(database: app.db),
+        configuration: .init(flushInterval: config.hitFlushInterval, maxPendingCodes: config.hitMaxPendingCodes),
+        logger: app.logger
+    )
+    app.hitCounter = hitCounter
+    app.lifecycle.use(HitCounterLifecycle(counter: hitCounter))
+
     // ── Register migrations ──
     app.migrations.add(CreateURLRecord())
     app.migrations.add(CreateCounter())

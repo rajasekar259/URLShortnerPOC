@@ -15,17 +15,17 @@ handling concurrent requests. Scaling out comes later.
 - [x] Tests for health, redirect, lookup and delete endpoints
 - [x] `Cache-Control: no-store` on redirect and metadata lookup (including their 404s); redirect stays a 307
 
-## In progress: redirect cache and hit counting (single server, in-process)
+## Done: redirect cache and hit counting (single server, in-process)
 
-- [ ] `RedirectCache` actor: bounded LRU (default 100k entries, 1h TTL), 30s negative cache, single-flight loads,
+- [x] `RedirectCache` actor on a reusable generic `LRUCache`: bounded LRU (default 100k entries, 1h TTL), 30s negative cache, single-flight loads,
       write-through on create, invalidate on delete, injectable clock for tests
-- [ ] `HitCounter` actor: count hits in memory, flush every 5s (or at 10k pending codes) with one additive batched
+- [x] `HitCounter` actor (wired to the app lifecycle and the redirect): count hits in memory, flush every 5s (or at 10k pending codes) with one additive batched
       `UPDATE ... FROM (VALUES ...)`; retry on failure; flush on graceful shutdown (accepted: a hard crash can lose up to 5s of counts)
-- [ ] Redirect path: cache, then single-flight DB load, then in-memory hit increment, with no DB call on a cache hit
-- [ ] Metadata lookup adds this process's pending count to the stored `hitCount`
-- [ ] Config: `CACHE_MAX_ENTRIES`, `CACHE_TTL_SECONDS`, `NEGATIVE_CACHE_TTL_SECONDS`, `HIT_FLUSH_INTERVAL_SECONDS`
-- [ ] Put both behind small protocols so a Redis-backed version can be added later
-- [ ] Tests: cache hit without DB, delete invalidation, LRU/TTL/negative expiry, single-flight, 1,000 concurrent
+- [x] Redirect path: cache, then single-flight DB load, then in-memory hit increment, with no DB call on a cache hit
+- [x] Metadata lookup adds this process's pending count to the stored `hitCount`
+- [x] Config: `CACHE_MAX_ENTRIES`, `CACHE_TTL_SECONDS`, `NEGATIVE_CACHE_TTL_SECONDS`, `HIT_FLUSH_INTERVAL_SECONDS`, `HIT_MAX_PENDING_CODES`
+- [x] Both sit behind small protocols (`RedirectCaching`, `HitStore`) so a Redis-backed version can be added later
+- [x] Tests: cache hit without DB, delete invalidation, LRU/TTL/negative expiry, single-flight, 1,000 concurrent
       redirects give exactly 1,000 hits, failed flush retries, flush on shutdown
 
 ## Next (small, current phase)
