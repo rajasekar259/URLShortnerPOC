@@ -59,25 +59,32 @@ private func shorten(_ app: Application, _ url: String) async throws -> (status:
 private struct Reply {
     var status: HTTPStatus
     var location: String?
+    var cacheControl: String?
     var body: ByteBuffer
 }
 
 private func send(_ app: Application, _ method: HTTPMethod, _ path: String) async throws -> Reply {
     var reply: Reply?
     try await app.testing().test(method, path, afterResponse: { res async throws in
-        reply = Reply(status: res.status, location: res.headers.first(name: .location), body: res.body)
+        reply = Reply(status: res.status,
+                      location: res.headers.first(name: .location),
+                      cacheControl: res.headers.first(name: .cacheControl),
+                      body: res.body)
     })
     return try #require(reply)
 }
 
-private func lookup(_ app: Application, _ code: String) async throws -> (status: HTTPStatus, info: URLController.LookupResponse?) {
+private func lookup(_ app: Application, _ code: String)
+    async throws -> (status: HTTPStatus, info: URLController.LookupResponse?, cacheControl: String?) {
     var status: HTTPStatus = .internalServerError
     var info: URLController.LookupResponse?
+    var cacheControl: String?
     try await app.testing().test(.GET, "api/url/\(code)", afterResponse: { res async throws in
         status = res.status
         info = try? res.content.decode(URLController.LookupResponse.self)
+        cacheControl = res.headers.first(name: .cacheControl)
     })
-    return (status, info)
+    return (status, info, cacheControl)
 }
 
 @Suite("Integration", .serialized)
@@ -250,6 +257,40 @@ extension Integration {
             try await withTestApp { app in
                 let hoisted1 = try await lookup(app, "0000000").status
                 #expect(hoisted1 == .notFound)
+            }
+        }
+
+        @Test("Redirect is temporary and must not be cached")
+        func redirectNotCacheable() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+                let reply = try await send(app, .GET, code)
+                // 301/308 are cached indefinitely by browsers; only a temporary redirect is safe.
+                #expect(reply.status == .temporaryRedirect)
+                #expect(reply.cacheControl == "no-store")
+            }
+        }
+
+        @Test("Redirect 404 must not be cached")
+        func redirectNotFoundNotCacheable() async throws {
+            try await withTestApp { app in
+                let reply = try await send(app, .GET, "0000000")
+                #expect(reply.status == .notFound)
+                #expect(reply.cacheControl == "no-store")
+            }
+        }
+
+        @Test("Metadata lookup must not be cached")
+        func lookupNotCacheable() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+                let found = try await lookup(app, code)
+                #expect(found.status == .ok)
+                #expect(found.cacheControl == "no-store")
+
+                let missing = try await lookup(app, "0000009")
+                #expect(missing.status == .notFound)
+                #expect(missing.cacheControl == "no-store")
             }
         }
 

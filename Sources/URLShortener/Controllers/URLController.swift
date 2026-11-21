@@ -89,15 +89,19 @@ struct URLController: RouteCollection {
         let code = try req.parameters.require("shortCode")
 
         guard let record = try await URLRecord.find(code, on: req.db) else {
-            throw Abort(.notFound, reason: "Short code '\(code)' not found")
+            throw Abort(.notFound, headers: Self.noStore, reason: "Short code '\(code)' not found")
         }
 
         // Bump hit counter
         record.hitCount += 1
         try await record.save(on: req.db)
 
-        // 302 = "go look elsewhere". In a browser this is transparent.
-        return req.redirect(to: record.longURL, redirectType: .temporary)
+        // 307 = temporary redirect, so browsers don't remember it (301/308 are cached forever).
+        // no-store also keeps proxies from caching it, so every click reaches the server and
+        // deletes take effect immediately.
+        let response = req.redirect(to: record.longURL, redirectType: .temporary)
+        response.headers.replaceOrAdd(name: .cacheControl, value: "no-store")
+        return response
     }
 
     // ──────────────────────────────────────────────
@@ -110,18 +114,26 @@ struct URLController: RouteCollection {
         var createdAt: Date
     }
 
-    func lookup(_ req: Request) async throws -> LookupResponse {
+    func lookup(_ req: Request) async throws -> Response {
         let code = try req.parameters.require("shortCode")
         guard let record = try await URLRecord.find(code, on: req.db) else {
-            throw Abort(.notFound, reason: "Not found")
+            throw Abort(.notFound, headers: Self.noStore, reason: "Not found")
         }
-        return LookupResponse(
+        let info = LookupResponse(
             shortCode: code,
             longURL:   record.longURL,
             hitCount:  record.hitCount,
             createdAt: record.createdAt ?? Date()
         )
+        // hitCount changes on every redirect, so this must never be served from a cache.
+        let response = try await info.encodeResponse(for: req)
+        response.headers.replaceOrAdd(name: .cacheControl, value: "no-store")
+        return response
     }
+
+    /// Headers for responses that must never be cached (also attached to 404s so an
+    /// intermediary can't remember "not found" for a code that is created later).
+    private static let noStore: HTTPHeaders = [HTTPHeaders.Name.cacheControl.description: "no-store"]
 
     // ──────────────────────────────────────────────
     // DELETE /api/url/:shortCode
