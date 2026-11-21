@@ -5,6 +5,17 @@ import Fluent
 import VaporTesting
 @testable import URLShortener
 
+private enum TestSetupError: Error, CustomStringConvertible {
+    case unsafeDatabase(String)
+
+    var description: String {
+        switch self {
+        case .unsafeDatabase(let name):
+            "Refusing to run integration tests against database '\(name)': its name must end in '_test'."
+        }
+    }
+}
+
 /// Integration tests run against a real Postgres database (default: `urlshortener_test`).
 /// Create it once with `createdb urlshortener_test`, or point `TEST_DATABASE_URL` elsewhere.
 /// The schema is reverted and re-migrated before every test and reverted again afterwards (pass or
@@ -12,6 +23,9 @@ import VaporTesting
 private func withTestApp(_ body: (Application) async throws -> Void) async throws {
     let url = Environment.get("TEST_DATABASE_URL")
         ?? "postgres://\(NSUserName())@localhost:5432/urlshortener_test"
+    // These tests drop every table when they finish, so refuse anything that isn't a `_test` database.
+    let databaseName = URL(string: url)?.lastPathComponent ?? ""
+    guard databaseName.hasSuffix("_test") else { throw TestSetupError.unsafeDatabase(databaseName) }
     setenv("DATABASE_URL", url, 1)
 
     let app = try await Application.make(.testing)
@@ -42,6 +56,30 @@ private func shorten(_ app: Application, _ url: String) async throws -> (status:
 }
 
 /// All integration tests share one database, so they must run one at a time (nested suites inherit this).
+private struct Reply {
+    var status: HTTPStatus
+    var location: String?
+    var body: ByteBuffer
+}
+
+private func send(_ app: Application, _ method: HTTPMethod, _ path: String) async throws -> Reply {
+    var reply: Reply?
+    try await app.testing().test(method, path, afterResponse: { res async throws in
+        reply = Reply(status: res.status, location: res.headers.first(name: .location), body: res.body)
+    })
+    return try #require(reply)
+}
+
+private func lookup(_ app: Application, _ code: String) async throws -> (status: HTTPStatus, info: URLController.LookupResponse?) {
+    var status: HTTPStatus = .internalServerError
+    var info: URLController.LookupResponse?
+    try await app.testing().test(.GET, "api/url/\(code)", afterResponse: { res async throws in
+        status = res.status
+        info = try? res.content.decode(URLController.LookupResponse.self)
+    })
+    return (status, info)
+}
+
 @Suite("Integration", .serialized)
 enum Integration {}
 
@@ -154,6 +192,102 @@ extension Integration {
                 #expect(Set(results.compactMap { $0.1 }).count == 1)
                 let value7 = try await URLRecord.query(on: app.db).count()
                 #expect(value7 == 1)
+            }
+        }
+    }
+
+    @Suite("Other endpoints")
+    struct OtherEndpointTests {
+        @Test("GET /health returns ok")
+        func health() async throws {
+            try await withTestApp { app in
+                let reply = try await send(app, .GET, "health")
+                #expect(reply.status == .ok)
+                #expect(String(buffer: reply.body) == "ok")
+            }
+        }
+
+        @Test("GET /:code redirects to the normalized long URL")
+        func redirects() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://EXAMPLE.com/Path?x=1").code)
+                let reply = try await send(app, .GET, code)
+                #expect(reply.status == .temporaryRedirect)
+                #expect(reply.location == "https://example.com/Path?x=1")
+            }
+        }
+
+        @Test("GET /:code for an unknown code returns 404")
+        func redirectUnknown() async throws {
+            try await withTestApp { app in
+                let reply = try await send(app, .GET, "0000000")
+                #expect(reply.status == .notFound)
+                #expect(reply.location == nil)
+            }
+        }
+
+        @Test("GET /api/url/:code returns metadata and counts redirects")
+        func lookupMetadata() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+
+                let before = try await lookup(app, code)
+                #expect(before.status == .ok)
+                #expect(before.info?.shortCode == code)
+                #expect(before.info?.longURL == "https://example.com/")
+                #expect(before.info?.hitCount == 0)
+
+                _ = try await send(app, .GET, code)
+                _ = try await send(app, .GET, code)
+
+                let after = try await lookup(app, code)
+                #expect(after.info?.hitCount == 2)
+            }
+        }
+
+        @Test("GET /api/url/:code for an unknown code returns 404")
+        func lookupUnknown() async throws {
+            try await withTestApp { app in
+                let hoisted1 = try await lookup(app, "0000000").status
+                #expect(hoisted1 == .notFound)
+            }
+        }
+
+        @Test("DELETE removes the link; lookup and redirect then return 404")
+        func deleteRemoves() async throws {
+            try await withTestApp { app in
+                let code = try #require(try await shorten(app, "https://example.com").code)
+
+                let deleted = try await send(app, .DELETE, "api/url/\(code)")
+                #expect(deleted.status == .noContent)
+
+                let hoisted2 = try await lookup(app, code).status
+
+                #expect(hoisted2 == .notFound)
+                let hoisted3 = try await send(app, .GET, code).status
+                #expect(hoisted3 == .notFound)
+                let hoisted4 = try await URLRecord.query(on: app.db).count()
+                #expect(hoisted4 == 0)
+            }
+        }
+
+        @Test("DELETE for an unknown code returns 404")
+        func deleteUnknown() async throws {
+            try await withTestApp { app in
+                let hoisted5 = try await send(app, .DELETE, "api/url/0000000").status
+                #expect(hoisted5 == .notFound)
+            }
+        }
+
+        @Test("Re-creating a deleted URL issues a new code")
+        func recreateAfterDelete() async throws {
+            try await withTestApp { app in
+                let first = try #require(try await shorten(app, "https://example.com").code)
+                _ = try await send(app, .DELETE, "api/url/\(first)")
+                let second = try #require(try await shorten(app, "https://example.com").code)
+                #expect(second != first)
+                let hoisted6 = try await send(app, .GET, second).status
+                #expect(hoisted6 == .temporaryRedirect)
             }
         }
     }

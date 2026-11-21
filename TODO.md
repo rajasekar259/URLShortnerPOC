@@ -11,11 +11,11 @@ handling concurrent requests. Scaling out comes later.
 - [x] Atomic counter reservation (`UPDATE ... RETURNING`, block size 1000, one refill in flight)
 - [x] Idempotent create: normalized URL, SHA-256 hash, unique constraint, `23505` race handling
 - [x] Unit and integration tests on a separate `urlshortener_test` database, cleaned up after each test
+- [x] Integration tests refuse to run against any database whose name does not end in `_test`
+- [x] Tests for health, redirect, lookup and delete endpoints
 
 ## Next (small, current phase)
 
-- [ ] Refuse to run integration tests unless the database name ends in `_test`
-- [ ] Tests for the redirect, lookup and delete endpoints
 - [ ] Atomic hit counter: `UPDATE ... SET "hitCount" = "hitCount" + 1` (today it is read-modify-write and can lose counts)
 - [ ] Validate the short-code format (exactly 7 Base62 characters) before querying the database
 - [ ] Push the repo: switch to a GitHub account with write access, then force-push (the first commit was amended after it was pushed)
