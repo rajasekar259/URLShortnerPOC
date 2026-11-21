@@ -24,6 +24,16 @@ let package = Package(
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]
+        ),
+        .testTarget(
+            name: "URLShortenerTests",
+            dependencies: [
+                "URLShortener",
+                .product(name: "VaporTesting", package: "vapor")
+            ],
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
         )
     ]
 )
