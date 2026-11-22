@@ -16,6 +16,8 @@ func configure(_ app: Application) async throws {
     app.http.server.configuration.port = config.port
 
     // ── Database ──
+    // Create the database on first start; migrations below only create tables inside it.
+    await DatabaseBootstrap.ensureDatabaseExists(url: config.databaseURL, logger: app.logger)
     app.databases.use(try .postgres(url: config.databaseURL), as: .psql)
 
     // ── Redirect cache (in-process LRU; swap for a shared cache when running several instances) ──
